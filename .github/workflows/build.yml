@@ -1,26 +1,101 @@
 name: Build APK
-on: [push, workflow_dispatch]
+
+# Ne zaman çalışır: depoya yeni bir .zip yüklenince, bu dosya değişince, ya da elle (Actions > Build APK > Run workflow)
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+# Eski zip'leri ve eski işlemleri silebilmek için izinler
+permissions:
+  contents: write
+  actions: write
+
+# Arka arkaya iki yükleme olursa eskisi iptal olur, yalnızca en yenisi derlenir
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+env:
+  KEEP: 5   # depoda kalacak zip sayısı = tutulacak işlem sayısı
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: En yeni zip'i bul
+        run: |
+          list_zips() {   # "zaman|dosya" satırları, en yeni en üstte (depoya eklenme/güncellenme zamanına göre)
+            for f in *.zip; do
+              [ -e "$f" ] || continue
+              echo "$(git log --diff-filter=AM --format=%ct -1 -- "$f")|$f"
+            done | sort -t'|' -k1,1nr -k2,2Vr
+          }
+          ZIP=$(list_zips | head -n1 | cut -d'|' -f2-)
+          if [ -z "$ZIP" ]; then echo "Depoda zip yok. Önce bir zip yükle."; exit 1; fi
+          echo "Derlenen zip: $ZIP"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
+
       - uses: gradle/actions/setup-gradle@v3
         with: { gradle-version: 8.9 }
-      - name: Zip ac
+
+      - name: Zip aç
         run: |
-          ZIP=$(find . -maxdepth 1 -iname '*.zip' | sort -V | tail -n1)   # birden fazla zip varsa en yüksek sürümlüyü al
-          echo "Derlenen zip: $ZIP"
           rm -rf _src && mkdir _src
           unzip -oq "$ZIP" -d _src
           S=$(find _src -name settings.gradle.kts -not -path '*/__MACOSX/*' | head -n1)
+          if [ -z "$S" ]; then echo "Zip içinde settings.gradle.kts bulunamadı"; exit 1; fi
           echo "PROJ=$(dirname "$S")" >> "$GITHUB_ENV"
+
       - name: Derle
         run: gradle assembleDebug
         working-directory: ${{ env.PROJ }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: BenimKlavyem
           path: ${{ env.PROJ }}/app/build/outputs/apk/debug/*.apk
+          retention-days: 7          # kota dolmasın: 7 gün sonra kendiliğinden silinir
+          if-no-files-found: error
+
+      # ---- Temizlik (derleme başarısız olsa bile çalışır) ----
+      - name: Eski zip'leri sil (son 5 kalsın)
+        if: always()
+        run: |
+          list_zips() {
+            for f in *.zip; do
+              [ -e "$f" ] || continue
+              echo "$(git log --diff-filter=AM --format=%ct -1 -- "$f")|$f"
+            done | sort -t'|' -k1,1nr -k2,2Vr
+          }
+          list_zips | tail -n +$((KEEP + 1)) | cut -d'|' -f2- | while IFS= read -r f; do
+            echo "Siliniyor: $f"
+            git rm -q -- "$f"
+          done
+          if ! git diff --cached --quiet; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -q -m "Eski zip'ler silindi (son $KEEP kaldı)"
+            git push || { git pull --rebase -q && git push; }
+          fi
+
+      - name: Eski işlemleri ve APK'larını sil (son 5 kalsın)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # işlem silinince içindeki APK (artifact) de silinir; liste en yeniden eskiye gelir
+          gh run list --limit 200 --json databaseId --jq ".[$KEEP:] | .[].databaseId" | while read -r id; do
+            echo "İşlem siliniyor: $id"
+            gh run delete "$id" || true
+          done
